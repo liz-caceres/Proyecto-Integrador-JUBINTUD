@@ -53,7 +53,15 @@ function crearApp({ db, auth, apiKey, fetchFn = fetch }) {
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password, returnSecureToken: true }) });
     const datos = await r.json();
-    if (!r.ok) throw new ErrorNegocio('Mail o contraseña incorrectos.', 401);
+        if (!r.ok) {
+      const motivo = (datos.error && datos.error.message) || 'DESCONOCIDO';
+      console.error('Falló el login en Firebase:', motivo);
+      const credenciales = ['EMAIL_NOT_FOUND', 'INVALID_PASSWORD', 'INVALID_LOGIN_CREDENTIALS', 'USER_DISABLED'];
+      if (credenciales.some((c) => motivo.startsWith(c))) {
+        throw new ErrorNegocio('Mail o contraseña incorrectos.', 401);
+      }
+      throw new ErrorNegocio(`No se pudo iniciar sesión (${motivo}). Revisá la configuración de Firebase.`, 500);
+    }
     await db.collection('usuarios').doc(datos.localId)
       .set({ ultima_actividad: Timestamp.now() }, { merge: true });
     res.json({ idToken: datos.idToken, refreshToken: datos.refreshToken, uid: datos.localId });
