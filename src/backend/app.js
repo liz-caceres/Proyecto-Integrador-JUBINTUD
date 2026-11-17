@@ -53,7 +53,7 @@ function crearApp({ db, auth, apiKey, fetchFn = fetch }) {
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password, returnSecureToken: true }) });
     const datos = await r.json();
-        if (!r.ok) {
+    if (!r.ok) {
       const motivo = (datos.error && datos.error.message) || 'DESCONOCIDO';
       console.error('Falló el login en Firebase:', motivo);
       const credenciales = ['EMAIL_NOT_FOUND', 'INVALID_PASSWORD', 'INVALID_LOGIN_CREDENTIALS', 'USER_DISABLED'];
@@ -67,18 +67,73 @@ function crearApp({ db, auth, apiKey, fetchFn = fetch }) {
     res.json({ idToken: datos.idToken, refreshToken: datos.refreshToken, uid: datos.localId });
   }));
 
+  // Perfil del usuario logueado (lo usa el panel web para saber el rol).
+  app.get('/yo', protegida, ruta(async (req, res) => {
+    const doc = await db.collection('usuarios').doc(req.usuario.uid).get();
+    if (!doc.exists) throw new ErrorNegocio('Perfil no encontrado.', 404);
+    const u = doc.data();
+    res.json({
+      id: doc.id,
+      nombre: u.nombre || '',
+      apellido: u.apellido || '',
+      email: u.email || '',
+      rol: u.rol,
+      id_centro: u.id_centro || null,
+    });
+  }));
+
+  // --- Centros ---------------------------------------------------------
+  app.get('/centros', protegida, ruta(async (req, res) => {
+    const snap = await db.collection('centros').get();
+    res.json(snap.docs.map((d) => ({ id: d.id, ...serializar(d.data()) })));
+  }));
+
+  app.post('/centros', protegida, exigirRol('centro', 'administrador'), ruta(async (req, res) => {
+    const { nombre, direccion = '', telefono = '', email = '' } = req.body;
+    if (!nombre || !String(nombre).trim()) throw new ErrorNegocio('El nombre del centro es obligatorio.', 400);
+    const yoRef = db.collection('usuarios').doc(req.usuario.uid);
+    const yo = await yoRef.get();
+    if (yo.exists && yo.data().id_centro) throw new ErrorNegocio('Ya registraste un centro.', 409);
+    const ref = await db.collection('centros').add({
+      nombre: String(nombre).trim(), direccion, telefono, email,
+      estado: 'activo',
+      id_responsable: req.usuario.uid,
+      fecha_registro: Timestamp.now(),
+    });
+    await yoRef.set({ id_centro: ref.id }, { merge: true });
+    res.status(201).json({ id: ref.id });
+  }));
+
+  app.patch('/centros/:id/estado', protegida, exigirRol('administrador'), ruta(async (req, res) => {
+    const { estado } = req.body;
+    if (!['activo', 'suspendido'].includes(estado)) throw new ErrorNegocio('Estado inválido.', 400);
+    await db.collection('centros').doc(req.params.id).set({ estado }, { merge: true });
+    res.json({ id: req.params.id, estado });
+  }));
+
   // --- Actividades -----------------------------------------------------
+  // Pública. Con ?id_centro=XXX devuelve solo las de ese centro.
   app.get('/actividades', ruta(async (req, res) => {
-    const snap = await db.collection('actividades').get();
+    let consulta = db.collection('actividades');
+    if (req.query.id_centro) consulta = consulta.where('id_centro', '==', req.query.id_centro);
+    const snap = await consulta.get();
     res.json(snap.docs.map((d) => ({ id: d.id, ...serializar(d.data()) })));
   }));
 
   app.post('/actividades', protegida, exigirRol('centro', 'administrador'), ruta(async (req, res) => {
-    const { nombre, descripcion = '', fecha, cupos, dificultad = 'baja', lugar = '', ubicacion, id_centro } = req.body;
+    const { nombre, descripcion = '', fecha, cupos, dificultad = 'baja', lugar = '', ubicacion } = req.body;
+    const yo = await db.collection('usuarios').doc(req.usuario.uid).get();
+    // El id_centro sale del usuario; también se acepta en el body (para Postman).
+    const id_centro = req.body.id_centro || (yo.exists && yo.data().id_centro);
     const f = new Date(fecha);
-    if (!nombre || !id_centro) throw new ErrorNegocio('Nombre e id_centro son obligatorios.', 400);
+    if (!nombre) throw new ErrorNegocio('El nombre es obligatorio.', 400);
+    if (!id_centro) throw new ErrorNegocio('Primero registrá tu centro.', 400);
     if (!Number.isInteger(cupos) || cupos < 1) throw new ErrorNegocio('Los cupos deben ser un entero mayor a 0.', 400);
     if (Number.isNaN(f.getTime())) throw new ErrorNegocio('Fecha inválida (usar formato 2026-11-05T15:00:00).', 400);
+    const centro = await db.collection('centros').doc(id_centro).get();
+    if (centro.exists && centro.data().estado === 'suspendido') {
+      throw new ErrorNegocio('Tu centro está suspendido: no podés crear actividades.', 403);
+    }
     const ref = await db.collection('actividades').add({
       nombre, descripcion, cupos, dificultad, lugar, id_centro,
       fecha: Timestamp.fromDate(f),
@@ -88,6 +143,52 @@ function crearApp({ db, auth, apiKey, fetchFn = fetch }) {
     res.status(201).json({ id: ref.id });
   }));
 
+  app.patch('/actividades/:id', protegida, exigirRol('centro', 'administrador'), ruta(async (req, res) => {
+    const permitidos = ['nombre', 'descripcion', 'dificultad', 'lugar', 'estado'];
+    const cambios = {};
+    for (const k of permitidos) if (req.body[k] !== undefined) cambios[k] = req.body[k];
+    if (req.body.fecha) {
+      const f = new Date(req.body.fecha);
+      if (Number.isNaN(f.getTime())) throw new ErrorNegocio('Fecha inválida.', 400);
+      cambios.fecha = Timestamp.fromDate(f);
+    }
+    if (req.body.ubicacion) {
+      cambios.ubicacion = new GeoPoint(req.body.ubicacion.lat, req.body.ubicacion.lng);
+    }
+    await db.collection('actividades').doc(req.params.id).set(cambios, { merge: true });
+    res.json({ id: req.params.id });
+  }));
+
+  // Lista de inscriptos de una actividad (para el panel).
+  app.get('/actividades/:id/inscriptos', protegida, exigirRol('centro', 'administrador'), ruta(async (req, res) => {
+    const actDoc = await db.collection('actividades').doc(req.params.id).get();
+    if (!actDoc.exists) throw new ErrorNegocio('Actividad no encontrada.', 404);
+    const cupos = actDoc.data().cupos || 0;
+
+    // Se leen las inscripciones y se filtra acá, tolerando distintos nombres de campo.
+    const snap = await db.collection('inscripciones').get();
+    const delaActividad = snap.docs
+      .map((d) => d.data())
+      .filter((i) => (i.id_actividad || i.actividad_id || i.idActividad) === req.params.id)
+      .filter((i) => !['cancelada', 'cancelado'].includes(i.estado));
+
+    const inscriptos = [];
+    for (const i of delaActividad) {
+      const idUsuario = i.id_usuario || i.usuario_id || i.idUsuario;
+      if (!idUsuario) continue;
+      const u = await db.collection('usuarios').doc(idUsuario).get();
+      const datos = u.exists ? u.data() : {};
+      inscriptos.push({
+        id: idUsuario, nombre: datos.nombre || '', apellido: datos.apellido || '', email: datos.email || '',
+      });
+    }
+    res.json({
+      total_inscriptos: inscriptos.length,
+      cupos_disponibles: Math.max(cupos - inscriptos.length, 0),
+      inscriptos,
+    });
+  }));
+
   // --- Inscripciones ---------------------------------------------------
   app.post('/actividades/:id/inscripcion', protegida, ruta(async (req, res) => {
     res.status(201).json(await inscripciones.inscribir(req.usuario.uid, req.params.id));
@@ -95,6 +196,37 @@ function crearApp({ db, auth, apiKey, fetchFn = fetch }) {
 
   app.delete('/actividades/:id/inscripcion', protegida, ruta(async (req, res) => {
     res.json(await inscripciones.cancelar(req.usuario.uid, req.params.id));
+  }));
+
+  // --- Soporte (tickets) -----------------------------------------------
+  app.get('/tickets', protegida, exigirRol('administrador'), ruta(async (req, res) => {
+    const snap = await db.collection('tickets').get();
+    res.json(snap.docs.map((d) => ({ id: d.id, ...serializar(d.data()) })));
+  }));
+
+  app.patch('/tickets/:id', protegida, exigirRol('administrador'), ruta(async (req, res) => {
+    const { estado, respuesta } = req.body;
+    if (!['pendiente', 'en_proceso', 'resuelto'].includes(estado)) {
+      throw new ErrorNegocio('Estado inválido.', 400);
+    }
+    const cambios = { estado };
+    if (respuesta) cambios.respuesta = respuesta;
+    await db.collection('tickets').doc(req.params.id).set(cambios, { merge: true });
+    res.json({ id: req.params.id, estado });
+  }));
+
+  // --- Resumen del sistema (administrador) -----------------------------
+  app.get('/admin/resumen', protegida, exigirRol('administrador'), ruta(async (req, res) => {
+    const nombres = ['usuarios', 'centros', 'actividades', 'inscripciones', 'tickets'];
+    const snaps = await Promise.all(nombres.map((n) => db.collection(n).get()));
+    const totales = {};
+    nombres.forEach((n, i) => { totales[n] = snaps[i].size; });
+    const pendientes = snaps[4].docs.filter((d) => (d.data().estado || 'pendiente') === 'pendiente').length;
+    res.json({
+      totales,
+      tickets_pendientes: pendientes,
+      verificado_en: new Date().toISOString(),
+    });
   }));
 
   // --- Matching --------------------------------------------------------
